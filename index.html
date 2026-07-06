@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rocket Trajectory Simulator — Live Demo</title>
+<style>
+  body { margin:0; background:#0d1117; color:#e6e6f0; font-family: 'Segoe UI', system-ui, sans-serif; }
+  #wrap { max-width: 900px; margin:0 auto; padding:20px; }
+  h1 { font-size:1.3rem; margin-bottom:4px; }
+  p.sub { color:#9090a8; margin-top:0; font-size:0.9rem; }
+  canvas { background:#111726; border-radius:8px; display:block; margin:12px 0; }
+  .controls { display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; margin-bottom:10px;}
+  label { font-size:0.8rem; color:#b0b0c8; display:flex; flex-direction:column; gap:4px;}
+  input[type=range]{ width:100%; }
+  #readout { display:flex; gap:24px; flex-wrap:wrap; font-size:0.85rem; color:#c8c8e0; margin-top:8px;}
+  #readout b { color:#7fffd4; }
+  button { background:#3a3a5c; color:#fff; border:none; padding:8px 14px; border-radius:6px; cursor:pointer; font-size:0.85rem; margin-top:6px;}
+  button:hover { background:#4a4a72; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>Rocket Trajectory Simulator</h1>
+  <p class="sub">Point-mass model with ISA-style drag falloff, thrust curve, and wind. Drag sliders to redesign the flight live.</p>
+
+  <div class="controls">
+    <label>Launch angle from vertical: <span id="angleVal">5</span>°
+      <input type="range" id="angle" min="0" max="25" value="5"></label>
+    <label>Base wind (m/s): <span id="windVal">3</span>
+      <input type="range" id="wind" min="0" max="15" value="3"></label>
+    <label>Fin area scale: <span id="finVal">1.0</span>x
+      <input type="range" id="fin" min="30" max="250" value="100"></label>
+  </div>
+  <button id="runBtn">Re-run flight (new gust seed)</button>
+  <canvas id="c" width="860" height="420"></canvas>
+  <div id="readout">
+    <span>Apogee: <b id="apogeeOut">-</b> m</span>
+    <span>Downrange: <b id="rangeOut">-</b> m</span>
+    <span>Flight time: <b id="timeOut">-</b> s</span>
+    <span>Max speed: <b id="speedOut">-</b> m/s</span>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const G0 = 9.80665;
+
+const thrustCurve = [[0,0],[0.05,180],[0.2,220],[0.6,200],[1.2,160],[1.8,90],[2.0,0]];
+function thrustAt(t){
+  if(t>2.0) return 0;
+  for(let i=0;i<thrustCurve.length-1;i++){
+    const [t0,q0]=thrustCurve[i], [t1,q1]=thrustCurve[i+1];
+    if(t>=t0 && t<=t1) return q0 + (q1-q0)*(t-t0)/(t1-t0);
+  }
+  return 0;
+}
+function isaDensity(alt){
+  const T0=288.15,P0=101325,L=0.0065,R=287.05;
+  let T,P;
+  if(alt<11000){ T=T0-L*alt; P=P0*Math.pow(T/T0, G0/(R*L)); }
+  else { T=216.65; P=22632.06*Math.exp(-G0*(alt-11000)/(R*T)); }
+  return P/(R*T);
+}
+
+let rng_seed = 42;
+function rand(){ // simple LCG for reproducible gusts
+  rng_seed = (rng_seed*1103515245+12345) & 0x7fffffff;
+  return (rng_seed/0x7fffffff);
+}
+function gaussian(){
+  const u1=rand(), u2=rand();
+  return Math.sqrt(-2*Math.log(u1+1e-9))*Math.cos(2*Math.PI*u2);
+}
+
+function simulate(angleDeg, baseWind, finScale){
+  const dryMass=0.55, propMass=0.06, burnTime=2.0;
+  const bodyDia=0.041, area=Math.PI*(bodyDia/2)**2;
+  const cdBody=0.4;
+  const finArea = 0.0306*finScale; // baseline fin planform area scaled
+  const cd = cdBody + 0.15*(finArea/area);
+
+  const theta0 = (90-angleDeg)*Math.PI/180;
+  let x=0,y=0,vx=0,vy=0,t=0;
+  const dt=0.02;
+  const traj=[[x,y]];
+  let maxSpeed=0;
+  const gustStd = 1.5;
+
+  while(t<60){
+    const m = t>=burnTime ? dryMass : dryMass+propMass*(1-t/burnTime);
+    const thrust = thrustAt(t);
+    let dirx,diry;
+    const speed=Math.hypot(vx,vy);
+    if(speed>1e-6){ dirx=vx/speed; diry=vy/speed; }
+    else { dirx=Math.cos(theta0); diry=Math.sin(theta0); }
+
+    const rho = isaDensity(Math.max(y,0));
+    const wind = baseWind + gaussian()*gustStd;
+    const relvx = vx-wind, relvy=vy;
+    const relspeed = Math.hypot(relvx,relvy);
+    const drag = 0.5*rho*cd*area*relspeed*relspeed;
+    const dragx = relspeed>1e-6 ? -drag*(relvx/relspeed) : 0;
+    const dragy = relspeed>1e-6 ? -drag*(relvy/relspeed) : 0;
+
+    let ax = (thrust*dirx+dragx)/m;
+    let ay = (thrust*diry+dragy)/m - G0;
+
+    if(y<=0){
+      if(thrust<=m*G0){ ax=0; ay=0; vx=0; vy=0; }
+      else { vx=0; vy=Math.max(vy,0); }
+    }
+
+    vx += ax*dt; vy += ay*dt;
+    x += vx*dt; y += vy*dt;
+    if(y<0) y=0;
+    t += dt;
+    maxSpeed = Math.max(maxSpeed, Math.hypot(vx,vy));
+    traj.push([x,y]);
+    if(t>0.5 && y<=0 && traj.length>50) break;
+  }
+  const apogee = Math.max(...traj.map(p=>p[1]));
+  const apogeeIdx = traj.findIndex(p=>p[1]===apogee);
+  return { traj, apogee, apogeeTime: apogeeIdx*dt, range: x, flightTime: t, maxSpeed };
+}
+
+function draw(result){
+  ctx.fillStyle = '#111726';
+  ctx.fillRect(0,0,W,H);
+
+  const pad=40;
+  const maxX = Math.max(...result.traj.map(p=>p[0]), 10);
+  const maxY = Math.max(...result.traj.map(p=>p[1]), 10);
+  const sx = (W-2*pad)/maxX;
+  const sy = (H-2*pad)/maxY;
+  const scale = Math.min(sx,sy);
+
+  // ground line
+  ctx.strokeStyle = '#333a4a';
+  ctx.beginPath();
+  ctx.moveTo(pad, H-pad);
+  ctx.lineTo(W-pad, H-pad);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.strokeStyle = '#7fffd4';
+  ctx.lineWidth = 2;
+  result.traj.forEach(([x,y], i)=>{
+    const px = pad + x*scale;
+    const py = H-pad - y*scale;
+    if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+  });
+  ctx.stroke();
+
+  // apogee marker
+  const apIdx = result.traj.findIndex(p=>p[1]===result.apogee);
+  const [ax,ay] = result.traj[apIdx];
+  ctx.fillStyle = '#feca57';
+  ctx.beginPath();
+  ctx.arc(pad+ax*scale, H-pad-ay*scale, 5, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#c8c8e0';
+  ctx.font = '11px sans-serif';
+  ctx.fillText(`apogee: ${result.apogee.toFixed(0)} m`, pad+ax*scale+8, H-pad-ay*scale-6);
+}
+
+function run(){
+  const angle = +document.getElementById('angle').value;
+  const wind = +document.getElementById('wind').value;
+  const fin = +document.getElementById('fin').value/100;
+  document.getElementById('angleVal').textContent = angle;
+  document.getElementById('windVal').textContent = wind;
+  document.getElementById('finVal').textContent = fin.toFixed(2);
+
+  const result = simulate(angle, wind, fin);
+  draw(result);
+  document.getElementById('apogeeOut').textContent = result.apogee.toFixed(1);
+  document.getElementById('rangeOut').textContent = result.range.toFixed(1);
+  document.getElementById('timeOut').textContent = result.flightTime.toFixed(2);
+  document.getElementById('speedOut').textContent = result.maxSpeed.toFixed(1);
+}
+
+['angle','wind','fin'].forEach(id=>{
+  document.getElementById(id).addEventListener('input', run);
+});
+document.getElementById('runBtn').addEventListener('click', ()=>{
+  rng_seed = Math.floor(Math.random()*1e9);
+  run();
+});
+
+run();
+</script>
+</body>
+</html>
