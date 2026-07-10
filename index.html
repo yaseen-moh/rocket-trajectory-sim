@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>N-Body Orbital Simulator — Live Demo</title>
+<style>
+  body { margin:0; background:#0a0a12; color:#e8e8f0; font-family: 'Segoe UI', system-ui, sans-serif; }
+  #wrap { max-width: 900px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 1.3rem; font-weight: 600; margin-bottom: 4px; }
+  p.sub { color: #9090a8; margin-top: 0; font-size: 0.9rem; }
+  canvas { background: #000; border-radius: 8px; display:block; margin: 12px 0; cursor: crosshair; }
+  .controls { display:flex; flex-wrap:wrap; gap: 14px; align-items:center; margin-bottom: 10px;}
+  button { background:#3a3a5c; color:#fff; border:none; padding:8px 14px; border-radius:6px; cursor:pointer; font-size:0.85rem;}
+  button:hover { background:#4a4a72; }
+  label { font-size: 0.8rem; color:#b0b0c8; display:flex; align-items:center; gap:6px;}
+  input[type=range]{ width:110px; }
+  #stats { font-size: 0.8rem; color:#8888a8; display:flex; gap:20px; flex-wrap:wrap; }
+  .hint { font-size: 0.78rem; color:#6a6a88; margin-top:6px;}
+  .swatch { width:14px; height:14px; border-radius:50%; display:inline-block; vertical-align:middle; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>N-Body Orbital Simulator</h1>
+  <p class="sub">Velocity-Verlet integration, close-approach capture ("spin before hit"), and momentum-conserving merges — running live in your browser.</p>
+
+  <div class="controls">
+    <button id="pauseBtn">Pause</button>
+    <button id="resetBtn">Reset</button>
+    <label>Gravity strength <input type="range" id="gSlider" min="1" max="200" value="60"></label>
+    <label>Trail length <input type="range" id="trailSlider" min="10" max="400" value="150"></label>
+    <label>New body size <span id="radiusVal">5</span>px
+      <input type="range" id="radiusSlider" min="2" max="16" value="5"></label>
+    <label><input type="checkbox" id="avoidCheck" checked> Close-approach capture</label>
+    <label><input type="checkbox" id="mergeCheck" checked> Merge on collision</label>
+  </div>
+  <canvas id="c" width="860" height="500"></canvas>
+  <div id="stats">
+    <span id="energyStat">Energy drift: 0.00%</span>
+    <span id="bodyStat">Bodies: 0</span>
+    <span id="eventStat">Merges: 0</span>
+  </div>
+  <p class="hint">
+    <span class="swatch" style="background:#ffd34d"></span> Click anywhere to drop a new body (it gets a small automatic orbital nudge so it doesn't fall straight in).
+    &nbsp;&nbsp;Click-drag to launch it with a specific velocity — you'll see a live arrow while dragging.
+    &nbsp;&nbsp;White lines on each body show its current direction of travel.
+  </p>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const cx = W/2, cy = H/2;
+
+let G = 60;
+let paused = false;
+let avoidance = true;
+let mergeEnabled = true;
+let trailMax = 150;
+let mergeCount = 0;
+let e0 = null;
+let newBodyRadius = 5;
+
+const DENSITY = 0.9; // mass = DENSITY * radius^3, keeps mass consistent with size
+
+class Body {
+  constructor(x,y,vx,vy,mass,radius,color){
+    this.x=x; this.y=y; this.vx=vx; this.vy=vy;
+    this.mass=mass; this.radius=radius; this.color=color;
+    this.trail=[];
+  }
+}
+
+let bodies = [];
+
+function seed(){
+  bodies = [];
+  mergeCount = 0;
+  bodies.push(new Body(cx, cy, 0, 0, 20000, 14, '#ffd34d'));         // "sun"
+  bodies.push(new Body(cx+180, cy, 0, -8.2, 40, 5, '#5aa9ff'));       // planet
+  bodies.push(new Body(cx+180+55, cy, 0, -8.2-2.1, 5, 2.5, '#c9c9d8')); // moon
+  bodies.push(new Body(cx-260, cy+40, 1.2, 6.6, 60, 6, '#ff7a59'));   // rogue body
+  e0 = totalEnergy();
+}
+
+function totalEnergy(){
+  let ke=0, pe=0;
+  for(let i=0;i<bodies.length;i++){
+    const b=bodies[i];
+    ke += 0.5*b.mass*(b.vx*b.vx+b.vy*b.vy);
+    for(let j=i+1;j<bodies.length;j++){
+      const o=bodies[j];
+      const dx=o.x-b.x, dy=o.y-b.y;
+      const d=Math.sqrt(dx*dx+dy*dy)+1e-6;
+      pe -= G*b.mass*o.mass/d;
+    }
+  }
+  return ke+pe;
+}
+
+function accelerations(){
+  const acc = bodies.map(()=>({ax:0, ay:0}));
+  for(let i=0;i<bodies.length;i++){
+    for(let j=0;j<bodies.length;j++){
+      if(i===j) continue;
+      const b=bodies[i], o=bodies[j];
+      const dx=o.x-b.x, dy=o.y-b.y;
+      // Softening length scales with the pair's combined radius. A fixed
+      // small softening (as used when bodies stay well separated) lets
+      // acceleration spike enormously during a genuine close approach --
+      // a classic fixed-timestep N-body artifact where the discrete step
+      // can't resolve how fast the force changes right near contact, and
+      // ends up injecting spurious kinetic energy instead of an accurate
+      // trajectory. Scaling softening with size keeps the force -- and the
+      // capture/spiral behavior above -- numerically well-behaved all the
+      // way down to the merge threshold.
+      const soft = Math.max(2, 0.6*(b.radius+o.radius));
+      const d2 = dx*dx+dy*dy+soft*soft;
+      const d = Math.sqrt(d2);
+      const f = G*o.mass/(d2*d);
+      acc[i].ax += f*dx;
+      acc[i].ay += f*dy;
+    }
+  }
+  return acc;
+}
+
+// Close-approach "capture": once two bodies get close, take over their
+// relative motion directly -- shrinking the separation and spinning its
+// angle a little more each frame -- rather than continuing to integrate
+// gravity through the closest part of the approach. A fixed timestep
+// leapfrog integrator can't resolve how fast force changes right near
+// contact (a classic N-body pitfall): even with size-scaled softening,
+// two large-mass bodies passing very close can pick up an enormous, quite
+// unphysical velocity spike in a single step. Prescribing the inspiral
+// kinematically sidesteps that instability completely, and guarantees any
+// close approach -- head-on or glancing -- becomes a visible multi-orbit
+// spiral that reliably decays into a merge rather than a straight-line
+// collision or a runaway slingshot.
+//
+// Momentum is conserved by construction: the pair's center of mass is
+// advanced by its own existing velocity (not frozen), and both bodies are
+// repositioned symmetrically around that advancing point, so the
+// finite-difference velocities recovered afterward reproduce the original
+// system momentum exactly (derivation in the project README).
+function applyCloseApproachCapture(dt){
+  for(let i=0;i<bodies.length;i++){
+    for(let j=i+1;j<bodies.length;j++){
+      const b=bodies[i], o=bodies[j];
+      const dx=o.x-b.x, dy=o.y-b.y;
+      const d = Math.sqrt(dx*dx+dy*dy)+1e-6;
+      const contactRadius = b.radius+o.radius;
+      const captureRadius = 4.5*contactRadius;
+      if(d>=captureRadius || d<=contactRadius) continue;
+
+      const mb=b.mass, mo=o.mass, mtot=mb+mo;
+      const cmx = (mb*b.x+mo*o.x)/mtot, cmy = (mb*b.y+mo*o.y)/mtot;
+      const cvx = (mb*b.vx+mo*o.vx)/mtot, cvy = (mb*b.vy+mo*o.vy)/mtot;
+
+      const theta = Math.atan2(dy,dx);
+      const strength = 1 - (d-contactRadius)/(captureRadius-contactRadius); // 0 at edge .. 1 at contact
+
+      const shrinkRate = 0.0015 + 0.012*strength;
+      const spinRate = 0.09 + 0.28*strength;
+
+      const newD = Math.max(d*(1-shrinkRate), contactRadius*0.98);
+      const newTheta = theta + spinRate;
+      const Sx = newD*Math.cos(newTheta), Sy = newD*Math.sin(newTheta);
+
+      // advance the COM by its own velocity -- this is what keeps momentum
+      // correct; freezing the COM in place (an earlier version of this
+      // function did) silently erases the pair's existing momentum instead
+      // of preserving it.
+      const newCmx = cmx + cvx*dt, newCmy = cmy + cvy*dt;
+
+      const oldBX=b.x, oldBY=b.y, oldOX=o.x, oldOY=o.y;
+
+      b.x = newCmx - (mo/mtot)*Sx;
+      b.y = newCmy - (mo/mtot)*Sy;
+      o.x = newCmx + (mb/mtot)*Sx;
+      o.y = newCmy + (mb/mtot)*Sy;
+
+      b.vx = (b.x-oldBX)/dt; b.vy = (b.y-oldBY)/dt;
+      o.vx = (o.x-oldOX)/dt; o.vy = (o.y-oldOY)/dt;
+    }
+  }
+}
+
+function mergeCollisions(){
+  for(let i=0;i<bodies.length;i++){
+    for(let j=bodies.length-1;j>i;j--){
+      const b=bodies[i], o=bodies[j];
+      const dx=o.x-b.x, dy=o.y-b.y;
+      const d = Math.sqrt(dx*dx+dy*dy);
+      if(d < b.radius+o.radius){
+        const totalMass = b.mass+o.mass;
+        b.vx = (b.vx*b.mass + o.vx*o.mass)/totalMass;
+        b.vy = (b.vy*b.mass + o.vy*o.mass)/totalMass;
+        b.x = (b.x*b.mass + o.x*o.mass)/totalMass;
+        b.y = (b.y*b.mass + o.y*o.mass)/totalMass;
+        b.radius = Math.cbrt(b.radius**3 + o.radius**3);
+        b.mass = totalMass;
+        b.color = b.mass >= o.mass ? b.color : o.color;
+        bodies.splice(j,1);
+        mergeCount++;
+      }
+    }
+  }
+}
+
+function step(dt){
+  const positions = bodies.map(b=>({x:b.x,y:b.y}));
+  const velocities = bodies.map(b=>({vx:b.vx,vy:b.vy}));
+
+  const accOld = accelerations();
+  for(let i=0;i<bodies.length;i++){
+    const b=bodies[i];
+    b.x = positions[i].x + velocities[i].vx*dt + 0.5*accOld[i].ax*dt*dt;
+    b.y = positions[i].y + velocities[i].vy*dt + 0.5*accOld[i].ay*dt*dt;
+  }
+  const accNew = accelerations();
+  for(let i=0;i<bodies.length;i++){
+    bodies[i].vx = velocities[i].vx + 0.5*(accOld[i].ax+accNew[i].ax)*dt;
+    bodies[i].vy = velocities[i].vy + 0.5*(accOld[i].ay+accNew[i].ay)*dt;
+  }
+
+  // Safety clamp: even with size-scaled softening above, an unlucky very
+  // close pass at a large timestep can still spike a body's speed for one
+  // frame. This is a visual demo, not a research integrator, so cap speed
+  // rather than let a rare edge case send a body flying off permanently.
+  const MAX_SPEED = 120;
+  for(const b of bodies){
+    const speed = Math.hypot(b.vx, b.vy);
+    if(speed > MAX_SPEED){
+      b.vx = (b.vx/speed)*MAX_SPEED;
+      b.vy = (b.vy/speed)*MAX_SPEED;
+    }
+  }
+
+  if(avoidance) applyCloseApproachCapture(dt);
+  if(mergeEnabled) mergeCollisions();
+
+  for(const b of bodies){
+    b.trail.push([b.x,b.y]);
+    if(b.trail.length>trailMax) b.trail.shift();
+  }
+}
+
+function run(steps, dt){
+  for(let s=0;s<steps;s++) step(dt);
+}
+
+function drawArrow(fromX, fromY, toX, toY, color){
+  const headLen = 6;
+  const angle = Math.atan2(toY-fromY, toX-fromX);
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(fromX,fromY); ctx.lineTo(toX,toY); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(toX, toY);
+  ctx.lineTo(toX-headLen*Math.cos(angle-Math.PI/6), toY-headLen*Math.sin(angle-Math.PI/6));
+  ctx.lineTo(toX-headLen*Math.cos(angle+Math.PI/6), toY-headLen*Math.sin(angle+Math.PI/6));
+  ctx.closePath();
+  ctx.fill();
+}
+
+function draw(){
+  ctx.fillStyle='#000';
+  ctx.fillRect(0,0,W,H);
+  for(const b of bodies){
+    ctx.beginPath();
+    for(let i=0;i<b.trail.length;i++){
+      const [tx,ty]=b.trail[i];
+      if(i===0) ctx.moveTo(tx,ty); else ctx.lineTo(tx,ty);
+    }
+    ctx.strokeStyle = b.color+'80';
+    ctx.lineWidth=1;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(b.x,b.y,b.radius,0,Math.PI*2);
+    ctx.fillStyle=b.color;
+    ctx.fill();
+
+    // direction indicator: line + arrowhead showing current velocity vector
+    const speed = Math.hypot(b.vx, b.vy);
+    if(speed > 0.05){
+      const dirLen = Math.min(14 + speed*1.8, 55);
+      const dx = (b.vx/speed)*dirLen, dy=(b.vy/speed)*dirLen;
+      drawArrow(b.x, b.y, b.x+dx, b.y+dy, 'rgba(255,255,255,0.85)');
+    }
+  }
+
+  // live drag preview
+  if(dragStart){
+    drawArrow(dragStart[0], dragStart[1], dragCurrent[0], dragCurrent[1], '#7fffd4');
+    ctx.beginPath();
+    ctx.arc(dragStart[0], dragStart[1], newBodyRadius, 0, Math.PI*2);
+    ctx.strokeStyle = '#7fffd4';
+    ctx.stroke();
+  }
+}
+
+function loop(){
+  if(!paused){
+    run(3, 0.4);
+    const e1 = totalEnergy();
+    const drift = e0 ? Math.abs((e1-e0)/e0)*100 : 0;
+    document.getElementById('energyStat').textContent = `Energy drift: ${drift.toFixed(3)}%`;
+    document.getElementById('bodyStat').textContent = `Bodies: ${bodies.length}`;
+    document.getElementById('eventStat').textContent = `Merges: ${mergeCount}`;
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// --- interaction: click to add, drag to set launch velocity ---
+let dragStart = null;
+let dragCurrent = null;
+
+canvas.addEventListener('mousedown', e=>{
+  const r = canvas.getBoundingClientRect();
+  dragStart = [e.clientX-r.left, e.clientY-r.top];
+  dragCurrent = [...dragStart];
+});
+canvas.addEventListener('mousemove', e=>{
+  if(!dragStart) return;
+  const r = canvas.getBoundingClientRect();
+  dragCurrent = [e.clientX-r.left, e.clientY-r.top];
+});
+canvas.addEventListener('mouseup', e=>{
+  const r = canvas.getBoundingClientRect();
+  const end = [e.clientX-r.left, e.clientY-r.top];
+  let vx = (end[0]-dragStart[0])*0.05;
+  let vy = (end[1]-dragStart[1])*0.05;
+
+  const dragDist = Math.hypot(end[0]-dragStart[0], end[1]-dragStart[1]);
+  if(dragDist < 4 && bodies.length){
+    // plain click (no explicit launch direction): give it a small automatic
+    // tangential nudge relative to the nearest existing body so it doesn't
+    // fall straight into it -- guarantees a curved approach / orbit rather
+    // than a degenerate zero-impact-parameter collision course.
+    let nearest = bodies[0], bestD = Infinity;
+    for(const b of bodies){
+      const d = Math.hypot(b.x-dragStart[0], b.y-dragStart[1]);
+      if(d < bestD){ bestD = d; nearest = b; }
+    }
+    const dx = dragStart[0]-nearest.x, dy = dragStart[1]-nearest.y;
+    const d = Math.hypot(dx,dy)+1e-6;
+    const tx = -dy/d, ty = dx/d;
+    const orbitalSpeed = Math.sqrt(G*nearest.mass/d) * 0.55;
+    vx = tx*orbitalSpeed;
+    vy = ty*orbitalSpeed;
+  }
+
+  const mass = DENSITY * Math.pow(newBodyRadius, 3);
+  const colors = ['#7fffd4','#ff9ff3','#feca57','#48dbfb','#ff6b6b'];
+  bodies.push(new Body(dragStart[0], dragStart[1], vx, vy, mass, newBodyRadius,
+    colors[Math.floor(Math.random()*colors.length)]));
+  e0 = totalEnergy();
+  dragStart = null; dragCurrent = null;
+});
+canvas.addEventListener('mouseleave', ()=>{ dragStart = null; dragCurrent = null; });
+
+document.getElementById('pauseBtn').addEventListener('click', e=>{
+  paused = !paused;
+  e.target.textContent = paused ? 'Resume' : 'Pause';
+});
+document.getElementById('resetBtn').addEventListener('click', seed);
+document.getElementById('gSlider').addEventListener('input', e=>{ G = +e.target.value; e0 = totalEnergy(); });
+document.getElementById('trailSlider').addEventListener('input', e=>{ trailMax = +e.target.value; });
+document.getElementById('radiusSlider').addEventListener('input', e=>{
+  newBodyRadius = +e.target.value;
+  document.getElementById('radiusVal').textContent = newBodyRadius;
+});
+document.getElementById('avoidCheck').addEventListener('change', e=>{ avoidance = e.target.checked; });
+document.getElementById('mergeCheck').addEventListener('change', e=>{ mergeEnabled = e.target.checked; });
+
+seed();
+loop();
+</script>
+</body>
+</html>
